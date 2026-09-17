@@ -34,7 +34,7 @@ use reth_db_api::{
     database::Database,
     models::{AccountBeforeTx, StorageBeforeTx, StorageSettings},
     tables,
-    transaction::DbTxMut,
+    transaction::{DbTx, DbTxMut},
 };
 use reth_node_types::NodeTypesWithDBAdapter;
 use reth_primitives_traits::{Account, Bytecode, StorageEntry};
@@ -50,7 +50,7 @@ use reth_stages::stages::{
 use reth_stages_api::{ExecInput, Stage};
 use reth_stages_types::{StageCheckpoint, StageId};
 use reth_static_file_types::StaticFileSegment;
-use reth_storage_api::{BlockBodyIndicesProvider, StageCheckpointWriter};
+use reth_storage_api::{BlockBodyIndicesProvider, StageCheckpointReader, StageCheckpointWriter};
 use reth_tasks::Runtime;
 use reth_tracing::tracing::info;
 
@@ -99,6 +99,10 @@ pub struct SnapshotImportFullArgs {
     /// Stream produced by `reth-export --mode full-snapshot`.
     #[arg(long, value_name = "FILE")]
     stream: PathBuf,
+
+    /// Resume a blocks-only interrupted import; the stream must start at the next committed block.
+    #[arg(long)]
+    resume_blocks: bool,
 
     /// Output datadir. Must be empty; `db`, `static_files` and `rocksdb` are created inside it.
     #[arg(long, value_name = "DIR")]
@@ -248,7 +252,13 @@ pub struct BlockSectionStats {
 }
 
 pub fn import_full(args: SnapshotImportFullArgs) -> eyre::Result<()> {
-    super::snapshot::ensure_fresh_import_target(&args.out)?;
+    if !args.resume_blocks {
+        super::snapshot::ensure_fresh_import_target(&args.out)?;
+    } else if !args.out.join("db").is_dir()
+        || args.out.join(super::snapshot::SNAPSHOT_IMPORT_MANIFEST_FILE).exists()
+    {
+        return Err(eyre::eyre!("resume requires an unfinished existing datadir"));
+    }
 
     let file = File::open(&args.stream)
         .map_err(|error| eyre::eyre!("open {}: {error}", args.stream.display()))?;
@@ -276,6 +286,19 @@ pub fn import_full(args: SnapshotImportFullArgs) -> eyre::Result<()> {
     std::fs::create_dir_all(&rocksdb_path)?;
 
     let factory = open_factory(&db_path, &static_files_path, &rocksdb_path, chain_spec)?;
+
+    if args.resume_blocks {
+        let provider = factory.provider()?;
+        let sfp = provider.static_file_provider();
+        if sfp.get_highest_static_file_block(StaticFileSegment::Headers).is_none()
+            || sfp.get_highest_static_file_block(StaticFileSegment::AccountChangeSets).is_some()
+            || sfp.get_highest_static_file_block(StaticFileSegment::StorageChangeSets).is_some()
+            || provider.tx_ref().entries::<tables::HashedAccounts>()? != 0
+            || provider.tx_ref().entries::<tables::HashedStorages>()? != 0
+        {
+            return Err(eyre::eyre!("resume requires committed blocks and no imported history or state"));
+        }
+    }
 
     let blocks = write_blocks(&factory, &mut stream, &manifest)?;
     info!(
@@ -439,7 +462,23 @@ where
     >,
 {
     let started = std::time::Instant::now();
-    let mut checkpoint = None;
+    let id = stage.id();
+    let mut checkpoint = factory.provider()?.get_stage_checkpoint(id)?;
+    if checkpoint.is_none() && id == StageId::SenderRecovery {
+        let provider = factory.provider()?;
+        let sfp = provider.static_file_provider();
+        if let Some(last) = sfp.get_highest_static_file_block(StaticFileSegment::TransactionSenders) {
+            let indices = provider.block_body_indices(last)?
+                .ok_or_else(|| eyre::eyre!("sender resume: body indices missing at {last}"))?;
+            if last > target || sfp.get_highest_static_file_tx(StaticFileSegment::TransactionSenders)
+                .map_or(0, |n| n + 1) != indices.next_tx_num()
+            {
+                return Err(eyre::eyre!("sender resume: inconsistent committed boundary"));
+            }
+            checkpoint = Some(StageCheckpoint::new(last));
+            info!(target: "arb-snapshot", last, "resuming committed sender recovery");
+        }
+    }
     loop {
         let provider = factory.database_provider_rw()?;
         let output = stage
@@ -451,6 +490,7 @@ where
                 },
             )
             .map_err(|error| eyre::eyre!("{what}: {error}"))?;
+        provider.save_stage_checkpoint(id, output.checkpoint)?;
         provider
             .commit()
             .map_err(|error| eyre::eyre!("{what}: commit: {error}"))?;
@@ -595,6 +635,35 @@ fn write_blocks<R: Read, DB: SnapshotDb>(
     let mut batch_txs = 0usize;
     let mut next_tx_num = 0u64;
     let mut first = true;
+    let mut resume_parent = None;
+    {
+        let provider = factory.provider()?;
+        let sfp = provider.static_file_provider();
+        if let Some(last) = sfp.get_highest_static_file_block(StaticFileSegment::Headers) {
+            let head = reth_storage_api::HeaderProvider::sealed_header(&provider, last)?
+                .ok_or_else(|| eyre::eyre!("resume header {last} missing"))?;
+            let indices = provider.block_body_indices(last)?
+                .ok_or_else(|| eyre::eyre!("resume body indices {last} missing"))?;
+            next_tx_num = indices.next_tx_num();
+            for segment in [StaticFileSegment::Transactions, StaticFileSegment::Receipts] {
+                if sfp.get_highest_static_file_tx(segment).map_or(0, |n| n + 1) != next_tx_num {
+                    return Err(eyre::eyre!("resume transaction boundary mismatch in {segment:?}"));
+                }
+            }
+            if last >= manifest.block {
+                return Err(eyre::eyre!("resume only supports an incomplete blocks section"));
+            }
+            stats.blocks = last + 1;
+            stats.bodies = last + 1;
+            stats.receipt_sets = last + 1;
+            stats.transactions = next_tx_num;
+            stats.receipts = next_tx_num;
+            stats.last_block = last;
+            first = false;
+            resume_parent = Some((last, head.hash()));
+            info!(target: "arb-snapshot", last, next_tx_num, "resuming committed blocks");
+        }
+    }
 
     loop {
         let record = stream.next_record()?;
@@ -628,6 +697,11 @@ fn write_blocks<R: Read, DB: SnapshotDb>(
                         "block {block}: header says it is block {}",
                         header.number
                     ));
+                }
+                if let Some((last, parent_hash)) = resume_parent.take() {
+                    if block != last + 1 || header.parent_hash != parent_hash {
+                        return Err(eyre::eyre!("resume stream does not extend committed block {last}"));
+                    }
                 }
                 pending = Some(PendingBlock {
                     number: block,

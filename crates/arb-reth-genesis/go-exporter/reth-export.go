@@ -137,7 +137,7 @@ func main() {
 	mode := flag.String("mode", "diag", "diag|state|blocks|history|full-snapshot|diskroot|accounts|addr|resume-point")
 	max := flag.Uint64("max", 0, "max accounts to dump (0 = all)")
 	addr := flag.String("addr", "", "for --mode addr: a 0x address to dump (storage key form check)")
-	from := flag.Int64("from", -1, "for --mode blocks: first block; for --mode history: first state id (default = earliest)")
+	from := flag.Int64("from", -1, "for --mode blocks/full-snapshot: first block; for --mode history: first state id (default = earliest)")
 	to := flag.Int64("to", -1, "for --mode blocks: last block; for --mode history: last state id (default = latest)")
 	// A large pebble block cache is critical for `--mode state`: the trie walk is random-read
 	// bound, and the default 16 MiB cache makes almost every node a cold disk read. Sizing this
@@ -344,7 +344,7 @@ func main() {
 		}
 		fmt.Fprintf(os.Stderr, "exported %d blocks [%d..%d]\n", nBlk, lo, hi)
 	case "full-snapshot":
-		fullSnapshot(db, anc, sdb, tdb, *parallel, *tmpdir, *arbitrumdata, *genesisBlock, *cacheMB, *handles)
+		fullSnapshot(db, anc, sdb, tdb, *parallel, *tmpdir, *arbitrumdata, *genesisBlock, *cacheMB, *handles, *from)
 	case "resume-point":
 		if *arbitrumdata == "" {
 			fatal("resume-point", fmt.Errorf("--arbitrumdata is required"))
@@ -415,6 +415,22 @@ func uint64Flag(v int64) uint64 {
 // `from` and `to` are state ids, not block numbers, because that is how the freezer is addressed.
 // Zero means "the whole available range". Each record carries its block number, so the importer
 // never has to infer the mapping (ids 0 and 1 are both block 0 on a chain built from genesis).
+func historyBounds(store ethdb.AncientReader) (uint64, uint64) {
+	tail, err := store.Tail()
+	if err != nil {
+		fatal("read state history tail", err)
+	}
+	head, err := store.Ancients()
+	if err != nil {
+		fatal("read state history count", err)
+	}
+	if tail >= head {
+		fatal("state history", fmt.Errorf("empty retained range [%d..%d)", tail, head))
+	}
+	fmt.Fprintf(os.Stderr, "retained state history ids: [%d..%d]\n", tail+1, head)
+	return tail + 1, head
+}
+
 func exportHistory(ancientDir string, from, to uint64) {
 	store, err := rawdb.NewStateFreezer(ancientDir, false, true)
 	if err != nil {
@@ -423,19 +439,19 @@ func exportHistory(ancientDir string, from, to uint64) {
 	defer store.Close()
 
 	// Ancients() counts items; state history ids are 1-based, so id i lives at position i-1.
-	count, err := store.Ancients()
-	if err != nil {
-		fatal("read state history count", err)
-	}
+	firstAvailable, count := historyBounds(store)
 	if count == 0 {
 		fatal("state freezer holds no history", fmt.Errorf("nothing to export from %s", ancientDir))
 	}
-	first, last := uint64(1), count
+	first, last := firstAvailable, count
 	if from != 0 {
 		first = from
 	}
 	if to != 0 && to < last {
 		last = to
+	}
+	if first < firstAvailable {
+		fatal("history range", fmt.Errorf("state id %d pruned; first available is %d", first, firstAvailable))
 	}
 	if first > last {
 		fatal("empty history range", fmt.Errorf("from %d > to %d", first, last))
@@ -636,10 +652,7 @@ func resolveConvertPoint(db ethdb.Database, ancientDir string, sdb state.Databas
 	}
 	defer store.Close()
 
-	count, err := store.Ancients()
-	if err != nil {
-		fatal("read state history count", err)
-	}
+	firstAvailable, count := historyBounds(store)
 	if count == 0 {
 		fatal("resolve convert point", fmt.Errorf("state freezer holds no history"))
 	}
@@ -648,7 +661,7 @@ func resolveConvertPoint(db ethdb.Database, ancientDir string, sdb state.Databas
 	// database. Scanning far past that would mean something is wrong, and silently converting an
 	// ancient state is worse than stopping.
 	const maxProbe = 512
-	for probe := uint64(0); probe < maxProbe && probe < count; probe++ {
+	for probe := uint64(0); probe < maxProbe && probe <= count-firstAvailable; probe++ {
 		id := count - probe
 		meta, _, _, _, _, err := rawdb.ReadStateHistory(store, id)
 		if err != nil {
@@ -677,7 +690,7 @@ func resolveConvertPoint(db ethdb.Database, ancientDir string, sdb state.Databas
 //
 // Sections are ordered so the importer can write append-only: blocks ascending, then history
 // ascending, then the state bulk load. Everything stops at P, so the three agree.
-func fullSnapshot(db ethdb.Database, ancientDir string, sdb state.Database, tdb *triedb.Database, parallel int, tmpDir string, arbitrumdata string, genesisBlock uint64, cacheMB, handles int) {
+func fullSnapshot(db ethdb.Database, ancientDir string, sdb state.Database, tdb *triedb.Database, parallel int, tmpDir string, arbitrumdata string, genesisBlock uint64, cacheMB, handles int, from int64) {
 	point := resolveConvertPoint(db, ancientDir, sdb)
 	fmt.Fprintf(os.Stderr, "convert point: block=%d root=%s stateID=%d\n",
 		point.block, point.root.Hex(), point.stateID)
@@ -703,7 +716,7 @@ func fullSnapshot(db ethdb.Database, ancientDir string, sdb state.Database, tdb 
 	w.WriteString(snapStreamMagic)
 
 	writeManifestSection(w, db, point, resume)
-	writeBlocksSection(w, db, point)
+	writeBlocksSection(w, db, point, from)
 	writeHistorySection(w, ancientDir, point)
 	writeStateSection(w, sdb, tdb, db, point, parallel, tmpDir)
 	w.WriteByte(snapSectionEnd)
@@ -736,11 +749,18 @@ func writeManifestSection(w *bufio.Writer, db ethdb.Database, point convertPoint
 //
 // The importer recomputes transactionsRoot and receiptsRoot from these and compares them against the
 // header, so a truncated or misaligned body is caught per block rather than at the end (ADR-004 B2).
-func writeBlocksSection(w *bufio.Writer, db ethdb.Database, point convertPoint) {
+func writeBlocksSection(w *bufio.Writer, db ethdb.Database, point convertPoint, from int64) {
 	w.WriteByte(snapSectionBlocks)
 	var blocks, bodies, receipts uint64
 	started := time.Now()
-	for n := uint64(0); n <= point.block; n++ {
+	first := uint64(0)
+	if from > 0 {
+		first = uint64(from)
+	}
+	if first > point.block {
+		fatal("block range", fmt.Errorf("start %d exceeds convert point %d", first, point.block))
+	}
+	for n := first; n <= point.block; n++ {
 		hash := rawdb.ReadCanonicalHash(db, n)
 		if hash == (common.Hash{}) {
 			fatal("read canonical hash", fmt.Errorf("gap at block %d", n))
@@ -786,7 +806,11 @@ func writeHistorySection(w *bufio.Writer, ancientDir string, point convertPoint)
 	defer store.Close()
 
 	started := time.Now()
-	emitted, skipped, accounts, slots := streamHistoryRange(w, store, 1, point.stateID, "history")
+	first, last := historyBounds(store)
+	if point.stateID < first || point.stateID > last {
+		fatal("history range", fmt.Errorf("convert point %d outside [%d..%d]", point.stateID, first, last))
+	}
+	emitted, skipped, accounts, slots := streamHistoryRange(w, store, first, point.stateID, "history")
 	w.WriteByte(snapRecEnd)
 	fmt.Fprintf(os.Stderr, "history section: %d objects (%d genesis v0 skipped), %d accounts, %d slots in %s\n",
 		emitted, skipped, accounts, slots, time.Since(started).Truncate(time.Second))

@@ -507,13 +507,21 @@ where
     // Batch-count gate (Nitro `InboxReader.GetBatchCount`): batches the `SequencerInbox` has posted
     // as of `spawn_cursor - 1`. A range that does not raise this count delivered no batches, hence no
     // L2 blocks, so it is skipped without a `getLogs` scan. `head_batch_count` caches it at `safe_head`.
+    let mut use_batch_count = true;
     let mut seen_batch_count = if cfg.start_block == 0 {
         0
     } else {
-        seq_reader
-            .batch_count(cfg.start_block - 1)
-            .await
-            .map_err(|e| L1SyncError::l1("batchCount(start_block-1)", e))?
+        match seq_reader.batch_count(cfg.start_block - 1).await {
+            Ok(count) => count,
+            Err(error) if error.to_string().contains("state at block")
+                && error.to_string().contains("is pruned") => {
+                tracing::warn!(target: "arb-reth::l1-sync",
+                    "historical L1 state pruned; scanning batch logs without batchCount optimization");
+                use_batch_count = false;
+                0
+            }
+            Err(error) => return Err(L1SyncError::l1("batchCount(start_block-1)", error)),
+        }
     };
     let mut head_batch_count = 0u64;
 
@@ -530,10 +538,12 @@ where
                 .await
                 .map_err(|_| L1SyncError::provider("get_block_number"))?;
             safe_head = head.saturating_sub(cfg.confirmations);
-            head_batch_count = seq_reader
-                .batch_count(safe_head)
-                .await
-                .map_err(|e| L1SyncError::l1("batchCount(safe_head)", e))?;
+            if use_batch_count {
+                head_batch_count = seq_reader
+                    .batch_count(safe_head)
+                    .await
+                    .map_err(|e| L1SyncError::l1("batchCount(safe_head)", e))?;
+            }
         }
 
         // Fill the prefetch pipeline. Instead of blindly scanning every fixed window with `getLogs`
@@ -551,6 +561,15 @@ where
             let scan_hi = cfg.end_block.map_or(safe_head, |end| end.min(safe_head));
             // Batch count at the first getLogs-sized window's end, and at the whole step's end.
             let win_to = (from + window - 1).min(scan_hi);
+            if !use_batch_count {
+                let (s, b) = (seq_reader.clone(), beacon.clone());
+                let handle = tokio::spawn(async move {
+                    resolve_batches(&s, b.as_ref(), from, win_to).await
+                });
+                inflight.0.push_back((from, win_to, handle));
+                spawn_cursor = win_to + 1;
+                continue;
+            }
             let win_batch_count = if win_to == safe_head {
                 head_batch_count
             } else {
