@@ -100,6 +100,8 @@ pub struct ArbLauncher {
     pub feed_latency: Option<FeedLatencyTracker>,
     /// Optional best-effort publisher for per-transaction execution logs.
     pub tx_log_stream: Option<ArbTxLogBroadcaster>,
+    /// Optional independent speculative receipt workers and RPC publisher.
+    pub spec_receipts: Option<crate::spec_receipts::SpecReceipts>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -238,6 +240,7 @@ impl ArbLauncher {
             l1_messages,
             feed_latency,
             tx_log_stream,
+            spec_receipts,
         } = self;
 
         let NodeBuilderWithComponents {
@@ -382,6 +385,9 @@ impl ArbLauncher {
         // `arb_evm_config` (hoisted from the RPC block below): also drives the engine tree.
         let arb_evm_config: arb_reth_evm::ArbEvmConfig =
             ctx.node_adapter().components.evm_config().clone();
+        if let Some(spec) = &spec_receipts {
+            spec.start(provider.clone(), arb_evm_config.clone(), chain_id, genesis_block)?;
+        }
         let frontier_store = tx_log_stream
             .as_ref()
             .map(ArbTxLogBroadcaster::frontier_store);
@@ -546,21 +552,20 @@ impl ArbLauncher {
                 jwt_secret: ctx.auth_jwt_secret()?,
             };
             let mut add_ons = crate::addons::arb_add_ons();
-            if let Some(frontier_store) = frontier_store {
-                let frontier_provider = provider.clone();
-                let frontier_evm_config = arb_evm_config.clone();
-                let frontier_gas_cap = ctx.node_config().rpc.rpc_gas_cap;
-                add_ons = add_ons.extend_rpc_modules(move |rpc| {
-                    let module = crate::mev_frontier_rpc::module(
-                        frontier_store,
-                        frontier_provider,
-                        frontier_evm_config,
-                        frontier_gas_cap,
-                    )?;
-                    rpc.modules.merge_configured(module)?;
-                    Ok(())
-                });
-            }
+            let frontier_provider = provider.clone();
+            let frontier_evm_config = arb_evm_config.clone();
+            let frontier_gas_cap = ctx.node_config().rpc.rpc_gas_cap;
+            add_ons = add_ons.extend_rpc_modules(move |rpc| {
+                if let Some(spec) = spec_receipts {
+                    rpc.modules.merge_configured(spec.module()?)?;
+                }
+                if let Some(frontier_store) = frontier_store {
+                    rpc.modules.merge_configured(crate::mev_frontier_rpc::module(
+                        frontier_store, frontier_provider, frontier_evm_config, frontier_gas_cap,
+                    )?)?;
+                }
+                Ok(())
+            });
             let handle = add_ons.launch_add_ons(add_ons_ctx).await?;
             Some(handle.rpc_server_handles.rpc)
         } else {
@@ -712,6 +717,7 @@ mod tests {
             l1_messages: l1_rx,
             feed_latency: None,
             tx_log_stream: None,
+            spec_receipts: None,
         };
 
         let handle = launcher
@@ -822,6 +828,7 @@ mod tests {
             l1_messages: l1_rx,
             feed_latency: None,
             tx_log_stream: None,
+            spec_receipts: None,
         };
         let handle = launcher
             .launch_node(node_builder_with_components)

@@ -298,6 +298,7 @@ pub(crate) async fn coordinate(
     output: mpsc::Sender<BroadcastFeedMessage>,
     feed_latency: FeedLatencyTracker,
     resume_sequence: Arc<AtomicU64>,
+    spec_receipts: Option<crate::spec_receipts::SpecReceipts>,
 ) {
     let mut race = SequenceRace::new(resume_sequence.load(Ordering::Acquire));
     while let Some(item) = ingress.recv().await {
@@ -313,6 +314,9 @@ pub(crate) async fn coordinate(
                 resume_sequence.store(race.next_resume, Ordering::Release);
                 feed_latency.record_frame_arrival(sequence, item.frame_received_at);
                 feed_latency.record_ready_for_channel(sequence, item.ready_for_channel_at);
+                if let Some(spec) = &spec_receipts {
+                    spec.submit(&item.message, item.frame_received_at);
+                }
                 if output.send(item.message).await.is_err() {
                     reth_tracing::tracing::warn!(
                         target: "arb-reth",
@@ -385,15 +389,8 @@ pub(crate) async fn follow(
 
                 while let Some(frame) = websocket.next().await {
                     let frame_received_at = Instant::now();
-                    let text = match frame {
-                        Ok(Message::Text(text)) => text.as_str().to_owned(),
-                        Ok(Message::Binary(bytes)) => match core::str::from_utf8(bytes.as_ref()) {
-                            Ok(text) => text.to_owned(),
-                            Err(_) => {
-                                metrics.errors.increment(1);
-                                continue;
-                            }
-                        },
+                    let bytes = match frame {
+                        Ok(frame @ (Message::Text(_) | Message::Binary(_))) => frame.into_data(),
                         Ok(Message::Close(_)) => break,
                         Ok(_) => continue,
                         Err(err) => {
@@ -409,7 +406,7 @@ pub(crate) async fn follow(
                         }
                     };
 
-                    let root = match serde_json::from_str::<Root>(&text) {
+                    let root = match serde_json::from_slice::<Root>(&bytes) {
                         Ok(root) => root,
                         Err(err) => {
                             metrics.errors.increment(1);
@@ -758,6 +755,7 @@ mod tests {
             output_tx,
             FeedLatencyTracker::new(),
             resume.clone(),
+            None,
         ));
 
         let started = Instant::now();

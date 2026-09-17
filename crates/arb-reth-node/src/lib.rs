@@ -57,6 +57,7 @@ pub mod launcher;
 pub use launcher::{ArbLauncher, ArbNodeHandle};
 
 mod mev_tx_logs;
+pub mod spec_receipts;
 mod mev_frontier_rpc;
 
 mod metrics;

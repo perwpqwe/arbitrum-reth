@@ -145,6 +145,10 @@ pub struct ArbNodeArgs {
     #[arg(long = "mev-tx-log-ipc", value_name = "PATH")]
     mev_tx_log_ipc: Option<PathBuf>,
 
+    /// Independent speculative feed execution workers (0 disables the arbtx subscription).
+    #[arg(long, default_value_t = 0)]
+    spec_receipt_workers: usize,
+
     /// Live sequencer-feed relay to follow, e.g. `ws://127.0.0.1:9642` (a nitro-testnode) or
     /// `wss://arb1.arbitrum.io/feed` (Arbitrum One). Repeat the option to race distinct relays. The
     /// first decoded copy of each sequence wins and later copies are discarded before execution.
@@ -679,6 +683,9 @@ async fn launch(
     builder.config_mut().rpc.disable_auth_server = true;
     let node_builder = builder.node(ArbNode);
 
+    let spec_receipts = (args.spec_receipt_workers != 0)
+        .then(|| crate::spec_receipts::SpecReceipts::new(args.spec_receipt_workers))
+        .transpose()?;
     let launcher = ArbLauncher {
         ctx: LaunchContext::new(task_executor.clone(), data_dir),
         chain_id: effective_chain_id,
@@ -688,6 +695,7 @@ async fn launch(
         l1_messages: l1_rx,
         feed_latency: feed_latency.clone(),
         tx_log_stream: mev_tx_log_ipc.as_ref().map(MevTxLogIpc::broadcaster),
+        spec_receipts: spec_receipts.clone(),
     };
 
     let handle = node_builder.launch_with(launcher).await?;
@@ -776,6 +784,7 @@ async fn launch(
             feed_tx.clone(),
             feed_latency,
             resume_sequence.clone(),
+            spec_receipts.clone(),
         ));
         for source in feed_sources {
             task_executor.spawn_task(feed::follow(

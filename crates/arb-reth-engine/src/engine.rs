@@ -391,6 +391,7 @@ pub(crate) fn produce_with_timing<'a>(
             );
             continue;
         }
+        let transaction_apply_us = tx_started_at.elapsed().as_micros();
         let frontier_id = match (frontier_block.as_mut(), tx_hash, tx_state_update) {
             (Some(frontier), Some(transaction_hash), Some(update)) => frontier.advance(
                 parent_header.number + 1,
@@ -404,6 +405,10 @@ pub(crate) fn produce_with_timing<'a>(
         if let (Some(stream), Some(transaction_hash), Some(logs)) =
             (tx_log_stream, tx_hash, tx_event_logs)
         {
+            let ready_unix_us = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros();
             stream.publish(ArbTxLogEvent {
                 block_number: parent_header.number + 1,
                 transaction_index,
@@ -414,6 +419,10 @@ pub(crate) fn produce_with_timing<'a>(
                 gas_used: tx_gas_used,
                 logs,
             });
+            tracing::debug!(target: "arb_reth::tx_timing",
+                block = parent_header.number + 1, transaction_index,
+                tx = %transaction_hash, transaction_apply_us, ready_unix_us,
+                "tx_ready");
         }
         transaction_index += 1;
         let mut retry_scheduling = Duration::ZERO;
