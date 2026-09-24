@@ -12,6 +12,13 @@ authors.workspace = true
 # arb-reth-derive (Stage F).
 
 [dependencies]
+yawc = { version = "=0.4.2", default-features = false }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+httpdate = "1"
+tokio-rustls = "0.26"
+webpki-roots = "1"
 arbitrum-alloy-consensus = { git = "https://github.com/nuntax/arbitrum-alloy", rev = "83593650bf6d07d2255e8627c417a9236cd5d02b", default-features = false, features = ["reth"] }
 arb-reth-evm = { path = "../arb-reth-evm", features = ["rpc"] }
 arb-revm.workspace = true

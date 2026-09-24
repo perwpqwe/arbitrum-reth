@@ -4,6 +4,10 @@
 //! only the first decoded copy to the engine, keeping duplicate work off the latency-sensitive
 //! execution channel.
 
+mod transport;
+#[cfg(test)]
+use tokio_tungstenite::tungstenite::http::StatusCode;
+
 use crate::metrics::FeedLatencyTracker;
 use arbitrum_alloy_sequencer::sequencer::feed::{BroadcastFeedMessage, Root};
 use eyre::{Result, ensure, eyre};
@@ -23,14 +27,10 @@ use tokio::{
     net::{TcpSocket, TcpStream},
     sync::mpsc,
 };
-use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, client_async_tls_with_config,
-    tungstenite::{
-        Error as WebSocketError, Message,
-        client::IntoClientRequest,
-        handshake::client::Response,
-        http::{HeaderValue, Request, StatusCode},
-    },
+use tokio_tungstenite::tungstenite::{
+    Error as WebSocketError,
+    client::IntoClientRequest,
+    http::{HeaderValue, Request},
 };
 
 const FEED_CLIENT_VERSION_HEADER: &str = "arbitrum-feed-client-version";
@@ -346,8 +346,6 @@ pub(crate) async fn follow(
     ingress: mpsc::Sender<FeedIngress>,
     resume_sequence: Arc<AtomicU64>,
 ) {
-    use futures_util::StreamExt;
-
     let metrics = Arc::new(FeedSourceMetrics::new(&source));
     let mut consecutive_failures = 0u32;
     // Spread the initial handshake burst. Several public relays rate-limit simultaneous upgrades
@@ -372,9 +370,13 @@ pub(crate) async fn follow(
 
         metrics.connection_attempts.increment(1);
         let mut pushed = 0usize;
-        let mut rate_limited = false;
-        match connect_source(&source, request).await {
-            Ok((mut websocket, _)) => {
+        let mut http_delay = None;
+        match tokio::time::timeout(Duration::from_secs(10), connect_source(&source, request))
+            .await
+            .map_err(eyre::Report::from)
+            .and_then(|result| result)
+        {
+            Ok((mut websocket, response)) => {
                 metrics.connected.set(1.0);
                 metrics.connections.increment(1);
                 reth_tracing::tracing::info!(
@@ -384,14 +386,23 @@ pub(crate) async fn follow(
                     relay = %source.display_endpoint,
                     local_ip = ?source.local_ip,
                     from_seq = requested_sequence,
+                    compression = ?response.headers().get("sec-websocket-extensions"),
                     "feed: connected to sequencer feed"
                 );
 
-                while let Some(frame) = websocket.next().await {
+                loop {
+                    let frame = websocket.next_frame().await;
                     let frame_received_at = Instant::now();
                     let bytes = match frame {
-                        Ok(frame @ (Message::Text(_) | Message::Binary(_))) => frame.into_data(),
-                        Ok(Message::Close(_)) => break,
+                        Ok(frame)
+                            if matches!(
+                                frame.opcode(),
+                                yawc::frame::OpCode::Text | yawc::frame::OpCode::Binary
+                            ) =>
+                        {
+                            frame.into_payload()
+                        }
+                        Ok(frame) if frame.opcode() == yawc::frame::OpCode::Close => break,
                         Ok(_) => continue,
                         Err(err) => {
                             metrics.errors.increment(1);
@@ -448,7 +459,7 @@ pub(crate) async fn follow(
                 );
             }
             Err(err) => {
-                rate_limited = is_rate_limited(&err);
+                http_delay = transport::retry_after(&err);
                 metrics.connected.set(0.0);
                 metrics.errors.increment(1);
                 reth_tracing::tracing::warn!(
@@ -456,7 +467,7 @@ pub(crate) async fn follow(
                     endpoint = source.endpoint,
                     connection = source.connection,
                     relay = %source.display_endpoint,
-                    rate_limited,
+                    retry_after_secs = http_delay.map(|delay| delay.as_secs()),
                     err = %err,
                     "feed: connection failed"
                 );
@@ -468,12 +479,13 @@ pub(crate) async fn follow(
         } else {
             0
         };
-        let delay = reconnect_delay(consecutive_failures, source.ordinal, rate_limited);
+        let delay = http_delay
+            .unwrap_or_else(|| reconnect_delay(consecutive_failures, source.ordinal, false));
         tokio::time::sleep(delay).await;
     }
 }
 
-type FeedWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type FeedWebSocket = transport::FeedSocket;
 
 /// Connect one feed lane, optionally binding its TCP socket before DNS-selected connection and
 /// TLS/WebSocket handshakes.
@@ -484,11 +496,7 @@ type FeedWebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 async fn connect_source(
     source: &FeedSource,
     request: Request<()>,
-) -> Result<(FeedWebSocket, Response), WebSocketError> {
-    let Some(local_ip) = source.local_ip else {
-        return tokio_tungstenite::connect_async(request).await;
-    };
-
+) -> Result<(FeedWebSocket, transport::FeedResponse)> {
     let parsed = url::Url::parse(&source.url).map_err(|err| {
         WebSocketError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -507,6 +515,11 @@ async fn connect_source(
             "validated feed URL has no known port",
         ))
     })?;
+    let Some(local_ip) = source.local_ip else {
+        let stream = TcpStream::connect((host, port)).await?;
+        stream.set_nodelay(true)?;
+        return transport::connect(request, stream).await;
+    };
     let remotes = tokio::net::lookup_host((host, port))
         .await
         .map_err(WebSocketError::Io)?;
@@ -544,7 +557,7 @@ async fn connect_source(
         }))
     })?;
 
-    client_async_tls_with_config(request, stream, None, None).await
+    transport::connect(request, stream).await
 }
 
 fn feed_request(url: &str, requested_sequence: u64) -> Result<Request<()>> {
@@ -569,6 +582,7 @@ fn initial_connect_delay(ordinal: usize) -> Duration {
     Duration::from_secs((ordinal as u64).min(10))
 }
 
+#[cfg(test)]
 fn is_rate_limited(err: &WebSocketError) -> bool {
     matches!(err, WebSocketError::Http(response) if response.status() == StatusCode::TOO_MANY_REQUESTS)
 }
